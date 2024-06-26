@@ -1,0 +1,18 @@
+Data collected at dry dock, 2024-06-24
+
+Data was collected in three runs
+1) Collection time: 15-06-30
+   File name: sss_data_6436.jpg
+   Scenario:Launched from SE stairs
+   Notes:
+
+2) Collection time: 15-35-21
+   File name: sss_data_12488.jpg
+   Scenario:
+   Notes:
+
+3) Collection time: 15-54-30
+   File name: sss_data_9626.jpg
+   Scenario: Launched from the SE stairs, one round trip down the center.
+   The return trip was performed in reverse.
+   Notes:
