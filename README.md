@@ -8,7 +8,7 @@ Scan of the relevant dry dock at Beckholmen
 
 Example of Sidescan returns
 ![](images/drydock_run2_example2.png)
-
+ 
 
 # Limitations
 - Currently, SAM is limited to very basic automatic operations or teleoperation at the surface.
