@@ -9,6 +9,7 @@ Scan of the relevant dry dock at Beckholmen
 Example of Sidescan returns
 ![](images/drydock_run2_example2.png)
 
+
 # Limitations
 - Currently, SAM is limited to very basic automatic operations or teleoperation at the surface.
 - Limited ground truth is available 
@@ -20,8 +21,9 @@ Example of Sidescan returns
 
 ## Approach A: ML
 Experiment with deep learning methods to classify the sss returns.
-I'm currently unsure about the details, but th will be filled in here as they become available.
+I'm currently unsure about the details, but they will be filled in here as they become available.
 
 ### Open Questions
-- Should I use the raw returns on maybe the down range gradients that were used for the buoy and rope detectors
-- Process channels together or separately
+- Should I use the raw returns on maybe the down range gradients that were used for the buoy and rope detectors?
+- Process channels together or separately?
+- What am I not considering?
