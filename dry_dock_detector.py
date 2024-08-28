@@ -1,20 +1,36 @@
 # %%
 import typing
 import os
+from typing import List, Optional
+
+from tqdm import tqdm
 
 import numpy as np
 import cv2 as cv
 from matplotlib import pyplot as plt
 
 import torch
-from torch.utils.data import Dataset, DataLoader
+from torch import Tensor
+import torch.nn as nn
+from torch.utils.data import Dataset, DataLoader, random_split
+import torch.optim as optim
+
+"""
+Work towards a PyTorch based wall detector for the dry dock environment.
+
+development environment: /opt/anaconda3/envs/svp_correction_env
+
+"""
 
 
 # %%
 class PreprocessData:
-    def __init__(self, sss_data_path: str, nadir_annotations_path: str, wall_annotations_path: str,
+    def __init__(self, sss_data_path: str, sss_seq_ids_path: str,
+                 nadir_annotations_path: str, wall_annotations_path: str,
                  start_arr_index: int = 0, end_arr_index: int = 0,
-                 per_channel_range: int = 0):
+                 per_channel_range: int = 0,
+                 grad_range_removal: Optional[List[float]] = None, range_resolution: Optional[float] = None,
+                 verbose: bool = False):
         """
         Prepare data for training and ...
         [ ] - Load date and the wall and nadir annotations
@@ -32,6 +48,7 @@ class PreprocessData:
 
         # Initialize class attributes, from parameters
         self.data_paths = {"sss": sss_data_path,
+                           "sss_seq_ids": sss_seq_ids_path,
                            "nadir": nadir_annotations_path,
                            "wall": wall_annotations_path}
 
@@ -39,16 +56,22 @@ class PreprocessData:
         self.end_arr_index = end_arr_index
         self.per_channel_range = per_channel_range
 
+        self.grad_range_removal = grad_range_removal
+        self.range_resolution = range_resolution
+        self.grad_removal_start = None
+        self.grad_removal_end = None
+
         # Initialize class attributes, other
         self.sss_arr_orig = None  # Originals contain the originals: pre truncating and filtering
         self.nadir_arr_orig = None
         self.wall_arr_orig = None
 
-        self.sss_arr = None
-        self.nadir_arr = None
-        self.wall_arr = None
+        self.sss_arr = None  # Contains sss data after truncation
+        self.seq_ids_arr = None  # Contains sequence IDs after truncation
+        self.nadir_arr = None  # Contains nadir annotation after truncation
+        self.wall_arr = None  # Contains contains wall after truncation
 
-        self.grad_arr = None
+        self.grad_arr = None  # processed version of self.sss_arr
 
         self.status_limit_checked = False
         self.status_truncated = False
@@ -57,16 +80,18 @@ class PreprocessData:
         self.operations_list = []
 
         # output
+        self.data_label = "testing"
         self.output_path = ""
 
         # Plotting parameters
-        # Plotting colors are given in RGB (Damn you openCV!!)
+        # Plotting colors are given in RGB (Damn you openCV!! which is BGR)
         self.nadir_color = np.array([0, 255, 0], dtype=np.uint8)
         self.wall_color = np.array([255, 0, 0], dtype=np.uint8)
 
         # Start preprocessing data
-        # Load data: sss, nadir, wall
+        # Load data: sss, sequence IDs, nadir, wall
         self.sss_arr_orig = self.load_image(self.data_paths["sss"])
+        self.sss_seq_ids_orig = np.genfromtxt(self.data_paths["sss_seq_ids"])
         self.nadir_arr_orig = self.load_image(self.data_paths["nadir"])
         self.wall_arr_orig = self.load_image(self.data_paths["wall"])
 
@@ -75,11 +100,15 @@ class PreprocessData:
         self.check_truncation_limits()
 
         # Perform truncation
-        self.sss_arr, self.nadir_arr, self.wall_arr = self.truncate_data()
+        self.sss_arr, self.seq_ids_arr, self.nadir_arr, self.wall_arr = self.truncate_data()
 
+        # Plot the annotation
         # self.show_annotation()
 
-        self.grad_arr = self.down_range_gradient(remove_ringdown=6, show=False)
+
+
+        self.check_gradient_removal_attributes()
+        self.grad_arr = self.down_range_gradient(remove_ringdown=6, show=verbose)
 
     # Function to load an image and convert it to a NumPy array
     @staticmethod
@@ -128,10 +157,49 @@ class PreprocessData:
                 self.sss_arr_orig.shape != self.wall_arr_orig.shape):
             raise ValueError("Size mismatch")
 
+    def check_gradient_removal_attributes(self):
+        # Check for multiple conditions that invalidate the provided values for removing gradient result w.r.t. range
+
+        if self.range_resolution is None:
+            self.grad_range_removal = None
+            return
+
+        if self.range_resolution <= 0:
+            self.range_resolution = None
+            self.grad_range_removal = None
+            return
+
+        if len(self.grad_range_removal) != 2:
+            self.range_resolution = None
+            self.grad_range_removal = None
+            return
+
+        if self.grad_range_removal[0] == self.grad_range_removal[1]:
+            self.range_resolution = None
+            self.grad_range_removal = None
+            return
+
+        # determine te proper indices between which to remove the gradient values
+        array_width = self.sss_arr.shape[1] // 2
+
+        min_index = int(min(self.grad_range_removal) // self.range_resolution)
+        max_index = int(max(self.grad_range_removal) // self.range_resolution)
+
+        if max_index == min_index:
+            return
+
+        if min_index <= 0 or max_index <= 0:
+            return
+
+        if max_index > array_width:
+            max_index = array_width
+
+        self.grad_removal_start = min_index
+        self.grad_removal_end = max_index
+
+
     def truncate_data(self):
         """
-
-        :param return_truncated_original_data:
         :return:
         """
         if not self.status_limit_checked:
@@ -148,19 +216,21 @@ class PreprocessData:
 
         trun_sss_arr_orig = self.sss_arr_orig[self.start_arr_index:self.end_arr_index,
                             start_range_ind:end_range_ind]
+        trun_seq_ids_orig = self.sss_seq_ids_orig[self.start_arr_index:self.end_arr_index]
+
         trun_nadir_arr_orig = self.nadir_arr_orig[self.start_arr_index:self.end_arr_index,
                               start_range_ind:end_range_ind]
         trun_wall_arr_orig = self.wall_arr_orig[self.start_arr_index:self.end_arr_index,
                              start_range_ind:end_range_ind]
 
-        return trun_sss_arr_orig, trun_nadir_arr_orig, trun_wall_arr_orig
+        return trun_sss_arr_orig, trun_seq_ids_orig, trun_nadir_arr_orig, trun_wall_arr_orig
 
     def set_working_to_truncated_original(self):
         """
         :return:
         """
 
-        self.sss_arr, self.nadir_arr, self.wall_arr = self.truncate_data()
+        self.sss_arr, self.seq_ids_arr, self.nadir_arr, self.wall_arr = self.truncate_data()
 
         self.operations_list = []
 
@@ -281,6 +351,11 @@ class PreprocessData:
             dx_port[:, :ringdown_ind] = 0  # Remove ringdown, mostly needed for negative gradient
             dx_star[:, :ringdown_ind] = 0
 
+            # Set gradient within range to 0
+            if self.grad_removal_start is not None and self.grad_removal_end is not None:
+                dx_port[:, self.grad_removal_start:self.grad_removal_end] = 0
+                dx_star[:, self.grad_removal_start:self.grad_removal_end] = 0
+
             dx = np.hstack((np.fliplr(dx_port), dx_star))  # .astype(np.int16)
 
             # Negative gradient
@@ -306,6 +381,18 @@ class PreprocessData:
 
                 ax1.title.set_text('Input image')
                 ax1.imshow(self.sss_arr)
+                # Add the region of gradient removal to help with debugging
+                if self.grad_removal_start is not None and self.grad_removal_end is not None:
+                    sss_width = self.sss_arr.shape[1]
+                    port_start = int(sss_width // 2 - self.grad_removal_start - 1)
+                    port_end = int(sss_width // 2 - self.grad_removal_end)
+                    stbd_start = int(sss_width // 2 + self.grad_removal_start)
+                    stbd_end = int(sss_width // 2 + self.grad_removal_end - 1)
+
+                    starts_and_stops = [stbd_start, stbd_end, port_start, port_end]
+                    for position in starts_and_stops:
+                        ax1.axvline(position, color='red')
+
 
                 ax2.title.set_text('Combined dx')
                 ax2.imshow(dx)
@@ -349,7 +436,8 @@ class PreprocessData:
 
 class ReformatData:
     def __init__(self, sss_data: np.ndarray, nadir_annotations: np.ndarray, wall_annotations: np.ndarray,
-                 slice_size: int = 10, step_size: int = 5, flipped_copies: bool = True):
+                 slice_size: int = 10, step_size: int = 5, flipped_copies: bool = True,
+                 normalize_sss: bool = True, format_n_c_h_w: bool = False):
         """
             Reformat the data into sub images and annotations.
             Operations:
@@ -409,6 +497,25 @@ class ReformatData:
             self.sss_formatted = self.AddFlippedCopies(self.sss_formatted)
             self.nadir_formatted = self.AddFlippedCopies(self.nadir_formatted)
             self.wall_formatted = self.AddFlippedCopies(self.wall_formatted)
+
+        if normalize_sss:
+            if np.max(self.sss_formatted) > 1.0:
+                self.sss_formatted = self.sss_formatted.astype(np.float32)
+                self.sss_formatted = np.divide(self.sss_formatted, 255)
+
+                self.nadir_formatted = self.nadir_formatted.astype(np.float32)
+                # nadir_max = self.nadir_formatted.max()
+                # nadir_min = self.nadir_formatted.min()
+                # self.nadir_formatted = (self.nadir_formatted - nadir_min) / (nadir_max - nadir_min)
+
+                self.wall_formatted = self.wall_formatted.astype(np.float32)
+                # wall_max = self.wall_formatted.max()
+                # wall_min = self.wall_formatted.min()
+                # self.wall_formatted = (self.wall_formatted - wall_min) / (wall_max - wall_min)
+
+        if format_n_c_h_w:
+            if len(self.sss_formatted.shape) != 4:
+                self.sss_formatted = np.expand_dims(self.sss_formatted, axis=1)
 
     def SliceArray(self, input_array):
         """
@@ -470,7 +577,6 @@ class ReformatData:
         """
         Plots the formatted data, the first dimension represents the image number -> [N,h,w]
         :param frame_interval:
-        :param formatted_array:
         :return:
         """
         # Create a figure and axis
@@ -490,9 +596,19 @@ class ReformatData:
 
 
 class TorchDataset(Dataset):
-    def __init__(self, sss_array, annotation_array, transform=None, annotation_transform=None):
-        self.sss_array = sss_array
-        self.annotation_array = annotation_array
+    """
+    TorchDataset class
+
+    Convert formatted data to torch
+
+    """
+
+    def __init__(self, sss_array: np.ndarray, annotation_array: np.ndarray,
+                 transform=None, annotation_transform=None):
+        # self.sss_array = sss_array
+        # self.annotation_array = annotation_array  # OLD: stored as np arrays and converted in __getitem__
+        self.sss_array = torch.tensor(sss_array)
+        self.annotation_array = torch.tensor(annotation_array)
         self.transform = transform
         self.target_transform = annotation_transform
 
@@ -500,29 +616,246 @@ class TorchDataset(Dataset):
         return self.sss_array.shape[0]
 
     def __getitem__(self, idx):
-        sss = torch.from_numpy(self.sss_array[idx, :, :]).float()
-        annotation = torch.from_numpy(self.sss_array[idx, :, :]).float()
+        # sss = torch.from_numpy(self.sss_array[idx, :, :]).float()
+        # annotation = torch.from_numpy(self.annotation_array[idx, :, :]).float()  # OLD: see __init__
 
-        # if self.transform:
-        #     sss = self.transform(sss)
-        # if self.target_transform:
-        #     annotation = self.target_transform(annotation)
+        annotation = self.annotation_array[idx]
+
+        if self.transform:
+            sss = self.transform(self.sss_array[idx])
+        else:
+            sss = self.sss_array[idx]
+
+        if self.target_transform:
+            # This is a more generic way of excepting the transformation as an argument
+            # annotation = self.target_transform(self.annotation_array[idx])
+            # For now use this
+            annotation = self.presence_range_tensor(self.annotation_array[idx])
+        else:
+            annotation = self.annotation_array[idx]
 
         return sss, annotation
 
+    @staticmethod
+    def first_nonzero_index_center_row(tensor: torch.Tensor):
+        """
+        Returns the first nonzero index of the central row in the tensor
+        :param tensor:
+        :return:
+        """
+        center_idx = tensor.shape[0] // 2
+        # Extract the specified row
+        row_values = tensor[center_idx, :]
 
-def main():
-    sss_path = "data/sss_data_6436.jpg"
+        # Find the indices where the values are non-zero
+        nonzero_indices = torch.nonzero(row_values, as_tuple=True)[0]
+
+        if len(nonzero_indices) > 0:
+            # Return the index of the first non-zero value
+            return nonzero_indices[0].item()
+        else:
+            # Return -1 if no non-zero value is present
+            return -1
+
+    @staticmethod
+    def presence_range_tensor(tensor: torch.Tensor):
+        """
+        Returns the first nonzero index of the central row in the tensor
+
+        normalize range values between 0 and 1
+
+        :param tensor:
+        :return:
+        """
+        # Extract the specified central row
+        center_idx = tensor.shape[0] // 2
+        row_values = tensor[center_idx, :]
+
+        max_range = tensor.shape[1]
+
+        # Find the indices where the values are non-zero
+        nonzero_indices = torch.nonzero(row_values, as_tuple=True)[0]
+
+        if len(nonzero_indices) > 0:
+            # Return the index of the first non-zero value
+            return torch.tensor([1, nonzero_indices[0].item()]).float()
+        else:
+            # Return -1 if no non-zero value is present
+            return torch.tensor([0, 0]).float()
+
+
+class TorchTrainingV1:
+    def __init__(self, training_data: DataLoader, testing_data: DataLoader):
+        self.training_data = training_data
+        self.testing_data = testing_data
+
+        self.model = self.FeatureDetectorSeparate()
+        self.loss = self.CustomLossSeparate()
+        self.optimizer = optim.Adam(self.model.parameters(), lr=0.001)
+
+    class FeatureDetectorSeparate(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.conv1 = nn.Conv2d(in_channels=1, out_channels=16, kernel_size=(9, 21))
+            # self.pool = nn.MaxPool2d(kernel_size=(1, 2))
+            # self.fc_presence = nn.Linear(16 * (500 - 21 + 1) // 2, 1)  # Output a single presence value
+            # self.fc_range = nn.Linear(16 * (500 - 21 + 1) // 2, 1)  # Output a single range
+            self.fc_presence = nn.Linear(16 * (500 - 21 + 1), 1)  # Output a single presence value
+            self.fc_range = nn.Linear(16 * (500 - 21 + 1), 1)  # Output a single range
+
+        def forward(self, x):
+            x = self.conv1(x)
+            # x = self.pool(x)  # Add pooling to reduce dimensionality
+            x = x.view(x.size(0), -1)  # Flatten the tensor
+
+            presence = torch.sigmoid(self.fc_presence(x))  # Sigmoid for binary classification
+            range_out = self.fc_range(x)  # Linear for regression
+
+            # Recombine in  to a single tensor
+            combined_output = torch.cat([presence, range_out], 1)
+
+            return combined_output
+
+    @staticmethod
+    def custom_loss_classification(output, target):
+        """
+        Computes the loss between a output tensor and a target tensor, assumes this is a classification loss
+        :param output:
+        :param target:
+        :return:
+        """
+        mask = (target != -1)  # Mask to select cases where the feature is detected
+        detection_loss = nn.MSELoss()(output[mask], target[mask]) if mask.sum() > 0 else 0
+        no_detection_loss = nn.MSELoss()(output[~mask], target[~mask]) if (~mask).sum() > 0 else 0
+        return detection_loss + no_detection_loss
+
+    # def custom_loss_reg(output, target):
+    #     """
+    #     Computes the loss between a output tensor and a target tensor, assumes this is a regression
+    #     :param target:
+    #     :return:
+    #     """
+    #     mask = (target != -1)  # Mask to select cases where the feature is detected
+    #     detection_loss = nn.MSELoss()(output[mask], target[mask]) if mask.sum() > 0 else 0
+    #     no_detection_loss = nn.MSELoss()(output[~mask], target[~mask]) if (~mask).sum() > 0 else 0
+    #     return detection_loss + no_detection_loss
+
+    class CustomLossSeparate(nn.Module):
+        """
+        Loss function for separate presence and range
+        """
+
+        def __init__(self, presence_weight=1.0, range_weight=1.0):
+            super().__init__()
+            self.bce_loss = nn.BCELoss()
+            self.mse_loss = nn.MSELoss()
+            self.presence_weight = presence_weight
+            self.range_weight = range_weight
+
+        def forward(self, output: Tensor, target: Tensor):
+            """
+            For with FeatureDetectorSeparate
+            Tensor[0]: presence
+            Tensor[1]: range
+            :param output:
+            :param target:
+            :return:
+            """
+            presence_loss = self.bce_loss(output[:, 0], target[:, 0]) * self.presence_weight
+
+            # Apply MSE only where presence is true
+            # if Tensor == 1:
+            #     range_loss = self.mse_loss(output[1], target[1]) * self.range_weight
+            # else:
+            #     range_loss = 0
+
+            mask = (target[:, 0] == 1)
+            range_loss = self.mse_loss(output[mask, 1], target[mask, 1]) if mask.any() else 0
+
+            return presence_loss + range_loss
+
+    def DoTraining(self, epochs=10):
+
+        for epoch in range(epochs):
+            running_loss = 0.0
+            for i, data in tqdm(enumerate(self.training_data)):
+                # get the inputs; data is a list of [inputs, labels]
+                inputs, labels = data
+
+                # zero the parameter gradients
+                self.optimizer.zero_grad()
+
+                # forward + backward + optimize
+                outputs = self.model(inputs)
+                loss = self.loss(outputs, labels)
+                loss.backward()
+                self.optimizer.step()
+
+                # print statistics
+                running_loss += loss.item()
+                if i % 10 == 0:  # print every 2000 mini-batches
+                    print(f'[{epoch + 1}, {i + 1:5d}] loss: {running_loss / 2000:.3f}')
+                    running_loss = 0.0
+
+
+def testing_pytorch(dataset: Dataset):
+    input_data, input_annotations = dataset.__getitem__(0)
+    input_shape = input_data.shape
+    input_dim = len(input_shape)
+
+    input_channels = input_shape[0]
+    input_h = input_shape[1]
+    input_w = input_shape[2]
+
+    # define a conv2d
+    conv_out_channels = 6
+    kernel_height = input_h
+    kernel_width = 21
+    stride = 1
+    padding_height = 0
+    padding_width = (kernel_width - 1) // 2
+
+    m = nn.Conv2d(in_channels=input_channels,
+                  out_channels=conv_out_channels,
+                  kernel_size=(kernel_height, kernel_width),
+                  stride=stride,
+                  padding=(padding_height, padding_width))
+
+    pool = nn.MaxPool1d(kernel_size=3, stride=1)
+
+    output = m(input_data)
+    output_shape = output.shape
+
+    print(f"Input shape: {input_shape}"
+          f"output shape: {output_shape}")
+
+
+def main_deep(debug=False):
+    sss_path = "data/sss_data_6436.jpg"  # Raw sss returns
+    seq_ids_path = "data/sss_seqs_6436.csv"  # csv that relates rows of sss data to sequence IDs
     nadir_path = "data/sss_data_6436_nadir.jpg"
     wall_path = "data/sss_data_6436_wall.jpg"
+
+    # Data preprocessing settings
+    start_idx = 0
+    end_idx = 0
+    channel_range = 500  # limits max range of each channel
+
+    # Data Formatting settings
+    slice_size = 9  # number of sss returns used to produce 'image', should be odd
+    step_size = 10  # size of step between slices, reduces overall size of training dataset
+
+    # training and test data settings
+    train_percentage = 0.7
+    batch_size = 32
 
     # Perform preprocessing
     preprocessed = PreprocessData(sss_data_path=sss_path,
                                   nadir_annotations_path=nadir_path,
                                   wall_annotations_path=wall_path,
-                                  start_arr_index=0,
-                                  end_arr_index=0,
-                                  per_channel_range=500)
+                                  start_arr_index=start_idx,
+                                  end_arr_index=end_idx,
+                                  per_channel_range=channel_range)
 
     # Display original and preprocessed images
 
@@ -535,21 +868,75 @@ def main():
     formatted = ReformatData(sss_data=sss_preproc,
                              nadir_annotations=nadir_preproc,
                              wall_annotations=wall_preproc,
-                             slice_size=10,
-                             step_size=10,
-                             flipped_copies=True)
+                             slice_size=slice_size,
+                             step_size=step_size,
+                             flipped_copies=True,
+                             normalize_sss=True,
+                             format_n_c_h_w=True)
 
     # Plot for debugging
-    formatted.PlotFormattedDataDebug()
+    if debug:
+        formatted.PlotFormattedDataDebug()
 
     dataset = TorchDataset(sss_array=formatted.sss_formatted,
-                           annotation_array=formatted.wall_formatted)
+                           annotation_array=formatted.wall_formatted,
+                           transform=None,
+                           annotation_transform=True)
+
+    # Split data into train and test
+    train_size = int(len(dataset) * train_percentage)
+    test_size = len(dataset) - train_size
+    train_dataset, test_dataset = random_split(dataset, lengths=[train_size, test_size])
+
+    train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True)
+    test_loader = DataLoader(test_dataset, batch_size=batch_size, shuffle=False)
+
+    print("Starting PyTorch stuff")
+
+    # TODO Remove
+    # testing_pytorch(dataset)
+
+    training = TorchTrainingV1(train_loader, test_loader)
+    training.DoTraining(10)
 
 
     print("Success!")
 
+def main_classic(debug=False):
+    sss_path = "data/sss_data_6436.jpg"
+    seq_ids_path = "data/sss_seqs_6436.csv"  # csv that relates rows of sss data to sequence IDs
+    nadir_path = "data/sss_data_6436_nadir.jpg"
+    wall_path = "data/sss_data_6436_wall.jpg"
+
+    # Data preprocessing settings
+    start_idx = 0
+    end_idx = 0
+    channel_range = 500  # limits max range of each channel
+
+    # Perform preprocessing
+    preprocessed = PreprocessData(sss_data_path=sss_path,
+                                  sss_seq_ids_path=seq_ids_path,
+                                  nadir_annotations_path=nadir_path,
+                                  wall_annotations_path=wall_path,
+                                  start_arr_index=start_idx,
+                                  end_arr_index=end_idx,
+                                  per_channel_range=channel_range,
+                                  grad_range_removal=[5.75, 6.25],
+                                  range_resolution=0.05,
+                                  verbose=True)
+
+    # Very basic detector
 
 
 
 if __name__ == "__main__":
-    main()
+    """
+    I leave it to the reader to decide between the deep and classic approaches
+    
+    Status
+    deep: Not working
+    classsic: Not working
+    """
+    # main_deep(debug=False)
+
+    main_classic()
